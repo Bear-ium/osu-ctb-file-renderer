@@ -1,0 +1,6 @@
+discord.py==2.7.1
+osrparse==7.0.1
+pillow==12.3.0
+numpy==2.5.3
+python-dotenv==1.2.4
+requests==2.34.2

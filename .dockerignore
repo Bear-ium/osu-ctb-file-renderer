@@ -1,0 +1,12 @@
+.git
+.env
+plan.md
+cache/
+tests/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.mp4
+*.osr
