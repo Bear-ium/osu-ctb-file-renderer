@@ -1,12 +1,15 @@
 """Fetches a map's song and background from beatmap mirrors. Everything downloaded is treated as untrusted."""
+import ipaddress
 import json
 import logging
 import os
 import shutil
+import socket
 import tempfile
 import time
 import zipfile
 from dataclasses import dataclass, field
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from PIL import Image, ImageOps
@@ -28,6 +31,8 @@ CHUNK_SIZE = 64 * 1024
 MAX_ZIP_MEMBERS = 5000
 MAX_OSU_MEMBER_BYTES = 16 * 1024 * 1024
 MAX_OSU_CHECKS = 100
+MAX_OSU_TOTAL_READ = 64 * 1024 * 1024
+MAX_REDIRECTS = 5
 MAX_AUDIO_BYTES = 40 * 1024 * 1024
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_PIXELS = 20_000_000
@@ -108,15 +113,18 @@ def ReadMember(archive, info, limit):
     return data
 
 
-def ArchiveHasVersion(archive, infos, beatmap_hash):
+def ArchiveHasVersion(archive, infos, beatmap_hash, osu_size=None):
+    """Look for the replay's exact .osu. When its size is known, only members of that exact size are read."""
     checked = 0
+    budget = MAX_OSU_TOTAL_READ
     for info in infos:
         if info.is_dir() or not info.filename.lower().endswith(".osu") or not SafeMemberName(info.filename):
             continue
-        if info.file_size > MAX_OSU_MEMBER_BYTES:
+        if info.file_size > MAX_OSU_MEMBER_BYTES or (osu_size is not None and info.file_size != osu_size):
             continue
         checked += 1
-        if checked > MAX_OSU_CHECKS:
+        budget -= info.file_size
+        if checked > MAX_OSU_CHECKS or budget < 0:
             break
         if Md5(ReadMember(archive, info, MAX_OSU_MEMBER_BYTES)) == beatmap_hash:
             return True
@@ -136,13 +144,13 @@ def PrepareBackground(source_path, destination):
     fitted.save(destination, "PNG")
 
 
-def ExtractSetAssets(osz_path, beatmap, beatmap_hash, staging_dir):
+def ExtractSetAssets(osz_path, beatmap, beatmap_hash, staging_dir, osu_size=None):
     """Pull the song and background out of a downloaded .osz. Returns (background, audio, matched_version)."""
     with zipfile.ZipFile(osz_path) as archive:
         infos = archive.infolist()
         if len(infos) > MAX_ZIP_MEMBERS:
             raise AssetError("archive has too many files")
-        if not ArchiveHasVersion(archive, infos, beatmap_hash):
+        if not ArchiveHasVersion(archive, infos, beatmap_hash, osu_size):
             return None, None, False
 
         audio_path = None
@@ -173,12 +181,49 @@ def ExtractSetAssets(osz_path, beatmap, beatmap_hash, staging_dir):
     return background_path, audio_path, True
 
 
+def ResolveHost(hostname):
+    return {info[4][0] for info in socket.getaddrinfo(hostname, 443, proto=socket.IPPROTO_TCP)}
+
+
+def CheckPublicHttpsUrl(url):
+    """Refuse anything but HTTPS on the default port to a host that only resolves to public addresses."""
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password or parts.port not in (None, 443):
+        raise AssetError(f"refusing to fetch {url!r}")
+    try:
+        addresses = ResolveHost(parts.hostname)
+    except OSError as error:
+        raise AssetError(f"couldn't resolve {parts.hostname}: {error}") from error
+    if not addresses:
+        raise AssetError(f"{parts.hostname} has no addresses")
+    for address in addresses:
+        if not ipaddress.ip_address(address.split("%")[0]).is_global:
+            raise AssetError(f"{parts.hostname} resolves to a non-public address")
+
+
+def OpenUrl(session, url, user_agent):
+    """GET with redirects followed by hand, so every hop is checked before it is requested."""
+    headers = {"User-Agent": user_agent, "Accept-Encoding": "identity"}
+    for _ in range(MAX_REDIRECTS + 1):
+        CheckPublicHttpsUrl(url)
+        response = session.get(url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), headers=headers, allow_redirects=False)
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get("Location", "")
+            response.close()
+            if not location:
+                raise AssetError("redirect without a location")
+            url = urljoin(url, location)
+            continue
+        return response
+    raise AssetError("too many redirects")
+
+
 def Download(session, url, destination, limit, deadline, user_agent):
-    with session.get(url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), headers={"User-Agent": user_agent}) as response:
+    with OpenUrl(session, url, user_agent) as response:
         if response.status_code != 200:
             raise AssetError(f"HTTP {response.status_code}")
-        if not response.url.startswith("https://"):
-            raise AssetError("redirected away from HTTPS")
+        if response.headers.get("Content-Encoding", "identity").lower() not in ("", "identity"):
+            raise AssetError("server sent a compressed response")
         declared = response.headers.get("Content-Length", "")
         if declared.isdigit() and int(declared) > limit:
             raise AssetError(f"file is {declared} bytes, over the limit")
@@ -199,7 +244,7 @@ def MirrorUrls(settings, set_id):
             yield template.replace("{set_id}", str(int(set_id)))
 
 
-def TryMirrors(session, beatmap, beatmap_hash, set_id, settings, staging_dir, deadline):
+def TryMirrors(session, beatmap, beatmap_hash, set_id, settings, staging_dir, deadline, osu_size=None):
     """Returns (background, audio, outcome) where outcome is "ok", "wrong_version" or "unavailable"."""
     work_dir = tempfile.mkdtemp(prefix="ctb-osz-")
     try:
@@ -210,7 +255,7 @@ def TryMirrors(session, beatmap, beatmap_hash, set_id, settings, staging_dir, de
             started = time.monotonic()
             try:
                 Download(session, url, osz_path, settings.max_set_download_bytes, deadline, settings.user_agent)
-                background, audio, matched = ExtractSetAssets(osz_path, beatmap, beatmap_hash, staging_dir)
+                background, audio, matched = ExtractSetAssets(osz_path, beatmap, beatmap_hash, staging_dir, osu_size)
             except Exception as error:
                 log.warning("Mirror %s failed after %.1fs: %s", url, time.monotonic() - started, error)
                 continue
@@ -337,16 +382,19 @@ def NotesFor(background, audio, outcome):
     return [f"No map background: {reason}."]
 
 
-def FetchSetAssets(beatmap, replay_hash, info, cache_dir, settings, session=None):
-    """Return the song and background for a replay's map. Never raises: failures become notes."""
+def FetchSetAssets(beatmap, replay_hash, info, cache_dir, settings, session=None, osu_size=None):
+    """Return the song and background for a replay's map. Never raises: failures become notes.
+
+    osu_size is the byte length of the replay's verified .osu, used to skip reading other difficulties.
+    """
     try:
-        return FetchSetAssetsUnsafe(beatmap, replay_hash, info, cache_dir, settings, session or requests.Session())
+        return FetchSetAssetsUnsafe(beatmap, replay_hash, info, cache_dir, settings, session or requests.Session(), osu_size)
     except Exception:
         log.exception("Fetching the song and background failed")
         return SetAssets(notes=["No music or map background: something went wrong fetching them."])
 
 
-def FetchSetAssetsUnsafe(beatmap, replay_hash, info, cache_dir, settings, session):
+def FetchSetAssetsUnsafe(beatmap, replay_hash, info, cache_dir, settings, session, osu_size):
     if not HASH_PATTERN.match(replay_hash):
         return SetAssets(notes=NotesFor(None, None, "no_set"))
     root = AssetsRoot(cache_dir)
@@ -365,7 +413,7 @@ def FetchSetAssetsUnsafe(beatmap, replay_hash, info, cache_dir, settings, sessio
     try:
         set_id = (info.beatmapset_id if info else 0) or beatmap.beatmapset_id
         if set_id:
-            background, audio, outcome = TryMirrors(session, beatmap, replay_hash, set_id, settings, staging_dir, deadline)
+            background, audio, outcome = TryMirrors(session, beatmap, replay_hash, set_id, settings, staging_dir, deadline, osu_size)
         else:
             background, audio, outcome = None, None, "no_set"
         if background is None and info is not None:

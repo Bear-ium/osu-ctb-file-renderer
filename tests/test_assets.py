@@ -125,18 +125,30 @@ def test_disallowed_audio_extension_is_skipped(tmp_path):
     assert matched and audio is None
 
 
+PUBLIC_HOSTS = {"mirror.example": "93.184.216.34", "assets.ppy.sh": "104.18.0.1", "cdn.example": "93.184.216.35",
+                "internal.example": "10.0.0.5", "metadata.example": "169.254.169.254", "loopback.example": "127.0.0.1"}
+
+
+@pytest.fixture(autouse=True)
+def fake_dns(monkeypatch):
+    monkeypatch.setattr(assets, "ResolveHost", lambda host: {PUBLIC_HOSTS[host]} if host in PUBLIC_HOSTS else set())
+
+
 class FakeResponse:
-    def __init__(self, url, body, status=200):
+    def __init__(self, url, body, status=200, headers=None):
         self.url = url
         self.body = body
         self.status_code = status
-        self.headers = {"Content-Length": str(len(body))}
+        self.headers = {"Content-Length": str(len(body)), **(headers or {})}
 
     def __enter__(self):
         return self
 
     def __exit__(self, *args):
         return False
+
+    def close(self):
+        pass
 
     def iter_content(self, size):
         for start in range(0, len(self.body), size):
@@ -154,6 +166,10 @@ class FakeSession:
         if route is None:
             raise assets.requests.ConnectionError("mirror unreachable")
         return FakeResponse(url, *route) if isinstance(route, tuple) else FakeResponse(url, route)
+
+
+def Redirect(location):
+    return (b"", 302, {"Location": location})
 
 
 SETTINGS = AssetSettings(mirrors=["https://mirror.example/d/{set_id}"])
@@ -238,3 +254,51 @@ def test_cache_evicts_oldest_entries(tmp_path):
                    FakeSession({"https://mirror.example/d/777": other_served}))
     assert not os.path.exists(first.audio_path)
     assert os.listdir(os.path.join(cache, "assets")) == [Md5(other_text.encode())]
+
+
+def test_redirects_are_followed_when_safe(tmp_path):
+    session = FakeSession({"https://mirror.example/d/777": Redirect("https://cdn.example/set.osz"),
+                           "https://cdn.example/set.osz": OszBytes(tmp_path, GoodMembers())})
+    result = FetchSetAssets(BEATMAP, OSU_HASH, None, str(tmp_path / "cache"), SETTINGS, session)
+    assert result.audio_path is not None
+
+
+@pytest.mark.parametrize("location", [
+    "http://cdn.example/set.osz",
+    "https://internal.example/set.osz",
+    "https://metadata.example/latest/meta-data",
+    "https://loopback.example/set.osz",
+    "https://cdn.example:8443/set.osz",
+    "https://unresolvable.example/set.osz",
+])
+def test_unsafe_redirects_are_never_requested(tmp_path, location):
+    session = FakeSession({"https://mirror.example/d/777": Redirect(location), location: OszBytes(tmp_path, GoodMembers())})
+    result = FetchSetAssets(BEATMAP, OSU_HASH, None, str(tmp_path / "cache"), SETTINGS, session)
+    assert result.audio_path is None
+    assert location not in session.requests
+
+
+def test_redirect_loops_give_up(tmp_path):
+    session = FakeSession({"https://mirror.example/d/777": Redirect("https://mirror.example/d/777")})
+    result = FetchSetAssets(BEATMAP, OSU_HASH, None, str(tmp_path / "cache"), SETTINGS, session)
+    assert result.audio_path is None
+    assert len(session.requests) == assets.MAX_REDIRECTS + 1
+
+
+def test_compressed_responses_are_refused(tmp_path):
+    session = FakeSession({"https://mirror.example/d/777": (OszBytes(tmp_path, GoodMembers()), 200, {"Content-Encoding": "gzip"})})
+    result = FetchSetAssets(BEATMAP, OSU_HASH, None, str(tmp_path / "cache"), SETTINGS, session)
+    assert result.audio_path is None
+
+
+def test_only_osu_members_of_the_known_size_are_read(tmp_path, monkeypatch):
+    members = GoodMembers()
+    members["other difficulty.osu"] = b"osu file format v14\n" + b"x" * 5000
+    reads = []
+    original = assets.ReadMember
+    monkeypatch.setattr(assets, "ReadMember", lambda archive, info, limit: reads.append(info.filename) or original(archive, info, limit))
+    staging = tmp_path / "out"
+    staging.mkdir()
+    _, audio, matched = ExtractSetAssets(MakeOsz(tmp_path / "set.osz", members), BEATMAP, OSU_HASH, str(staging), len(OSU_BYTES))
+    assert matched and audio is not None
+    assert reads == ["map.osu"]
