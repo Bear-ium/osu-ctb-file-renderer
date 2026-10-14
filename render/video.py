@@ -169,6 +169,7 @@ class FrameRenderer:
         self.small_font = LoadFont(14)
         self.player_font = LoadFont(20, bold=True)
         self.big_font = LoadFont(44, bold=True)
+        self.combo_font = LoadFont(56, bold=True)
         self.medium_font = LoadFont(22, bold=True)
         self.miss_font = LoadFont(26, bold=True)
 
@@ -296,10 +297,11 @@ class FrameRenderer:
     def DrawHud(self, draw, time):
         combo, accuracy = self.judgements.StateAt(time)
         misses = bisect.bisect_right(self.miss_times, time)
-        right_x = ScreenX(PLAYFIELD_WIDTH) + 20
-        draw.text((right_x, 50), f"{accuracy * 100:.2f}%", font=self.big_font, fill=TEXT_COLOUR)
-        draw.text((right_x, 150), f"{combo}x", font=self.big_font, fill=TEXT_COLOUR)
-        draw.text((right_x, 250), str(misses), font=self.big_font, fill=MISS_COLOUR if misses else TEXT_COLOUR)
+        right = WIDTH - TEXT_MARGIN
+        OutlinedText(draw, (right, TEXT_MARGIN - 4), f"{accuracy * 100:.2f}%", self.big_font, TEXT_COLOUR, anchor="ra")
+        OutlinedText(draw, (right, TEXT_MARGIN + 48), f"{misses} {'miss' if misses == 1 else 'misses'}", self.medium_font,
+                     MISS_COLOUR if misses else MUTED_TEXT, anchor="ra")
+        OutlinedText(draw, (TEXT_MARGIN, HEIGHT - TEXT_MARGIN - 4), f"{combo}x", self.combo_font, TEXT_COLOUR, anchor="ls")
 
         progress = min(max((time - self.start_time) / (self.end_time - self.start_time), 0), 1)
         draw.rectangle([0, HEIGHT - 4, WIDTH * progress, HEIGHT], fill=PROGRESS_COLOUR)
