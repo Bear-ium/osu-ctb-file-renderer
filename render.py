@@ -14,6 +14,11 @@ USER_ERROR_PREFIX = "USER_ERROR: "
 NOTE_PREFIX = "NOTE: "
 
 
+def OneLine(message):
+    """Messages for the bot go on stdout one per line; logs stay on stderr."""
+    return " ".join(str(message).split())
+
+
 def PeakMemoryMb():
     try:
         import resource
@@ -46,14 +51,14 @@ def Main():
         )
         result = RenderReplay(args.replay, args.output, config.cache_dir, api, max_bytes, osu_file=args.beatmap, options=options)
     except RenderError as error:
-        print(USER_ERROR_PREFIX + str(error), file=sys.stderr)
+        print(USER_ERROR_PREFIX + OneLine(error), flush=True)
         return EXIT_USER_ERROR
     except FfmpegMissingError as error:
         logging.error("%s", error)
         return 1
 
     for note in result.notes:
-        print(NOTE_PREFIX + note, file=sys.stderr)
+        print(NOTE_PREFIX + OneLine(note), flush=True)
     peak = PeakMemoryMb()
     if peak is not None:
         logging.info("Peak memory: %.0f MB", peak)

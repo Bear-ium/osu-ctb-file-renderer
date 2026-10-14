@@ -20,7 +20,9 @@ log = logging.getLogger("bot")
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RENDER_SCRIPT = os.path.join(PROJECT_ROOT, "render.py")
 USER_ERROR_PREFIX = "USER_ERROR: "
+NOTE_PREFIX = "NOTE: "
 EXIT_USER_ERROR = 2
+MAX_NOTES = 3
 
 
 class RenderQueue:
@@ -50,15 +52,30 @@ class RenderQueue:
         return None
 
 
+def ReadMessages(stdout):
+    """Pull USER_ERROR and NOTE lines from the child's stdout, which carries nothing else.
+
+    Logs go to stderr and can contain text from uploads and downloads, so they are never parsed for messages.
+    """
+    error = None
+    notes = []
+    for line in stdout.decode(errors="replace").splitlines():
+        if line.startswith(USER_ERROR_PREFIX):
+            error = line[len(USER_ERROR_PREFIX):]
+        elif line.startswith(NOTE_PREFIX) and len(notes) < MAX_NOTES:
+            notes.append(line[len(NOTE_PREFIX):])
+    return error, notes
+
+
 async def RunRender(config, replay_path, output_path, max_bytes):
-    """Render in a child process so a stuck job can be killed. Returns None on success, or an error message."""
+    """Render in a child process so a stuck job can be killed. Returns (error message or None, notes)."""
     command = [sys.executable, RENDER_SCRIPT, replay_path, output_path, "--max-mb", f"{max_bytes / (1024 * 1024):.3f}"]
     posix = os.name == "posix"
     process = await asyncio.create_subprocess_exec(
         *command, cwd=PROJECT_ROOT, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=posix,
     )
     try:
-        _, stderr = await asyncio.wait_for(process.communicate(), timeout=config.render_timeout_seconds)
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=config.render_timeout_seconds)
     except asyncio.TimeoutError:
         if posix:
             os.killpg(process.pid, signal.SIGKILL)
@@ -68,20 +85,22 @@ async def RunRender(config, replay_path, output_path, max_bytes):
         log.warning("Render timed out after %ss: %s", config.render_timeout_seconds, replay_path)
         seconds = config.render_timeout_seconds
         limit = f"{seconds // 60} minutes" if seconds >= 120 else f"{seconds} seconds"
-        return f"The render took longer than {limit} and was stopped. Try a shorter replay."
+        return f"The render took longer than {limit} and was stopped. Try a shorter replay.", []
 
-    output = stderr.decode(errors="replace").strip()
-    for line in output.splitlines():
-        if not line.startswith(USER_ERROR_PREFIX):
-            log.info("render: %s", line)
+    for line in stderr.decode(errors="replace").strip().splitlines():
+        log.info("render: %s", line)
+    error, notes = ReadMessages(stdout)
     if process.returncode == 0 and os.path.exists(output_path):
-        return None
-    if process.returncode == EXIT_USER_ERROR:
-        for line in reversed(output.splitlines()):
-            if line.startswith(USER_ERROR_PREFIX):
-                return line[len(USER_ERROR_PREFIX):]
+        return None, notes
+    if process.returncode == EXIT_USER_ERROR and error:
+        return error, []
     log.error("Render failed with exit code %s", process.returncode)
-    return "Something went wrong while rendering. The bot owner can check the logs."
+    return "Something went wrong while rendering. The bot owner can check the logs.", []
+
+
+def ResultMessage(player, notes):
+    """The reply that goes with the video, with any notes as small text underneath."""
+    return "\n".join([f"Replay by **{player}**", *(f"-# {note}" for note in notes)])
 
 
 async def Reply(interaction, content, file=None):
@@ -174,7 +193,7 @@ class RenderBot(discord.Client):
             try:
                 await Reply(interaction, f"Rendering replay by **{player}**...")
                 started = time.monotonic()
-                error = await RunRender(self.config, replay_path, output_path, max_bytes)
+                error, notes = await RunRender(self.config, replay_path, output_path, max_bytes)
                 log.info("Render for user %s took %.1fs (%s)", user_id, time.monotonic() - started, "ok" if error is None else error)
             finally:
                 self.queue.running -= 1
@@ -183,7 +202,7 @@ class RenderBot(discord.Client):
             if error is not None:
                 await Reply(interaction, error)
                 return
-            await Reply(interaction, f"Replay by **{player}**", file=discord.File(output_path, filename="replay.mp4"))
+            await Reply(interaction, ResultMessage(player, notes), file=discord.File(output_path, filename="replay.mp4"))
         except Exception:
             log.exception("Unexpected error handling /render")
             try:
