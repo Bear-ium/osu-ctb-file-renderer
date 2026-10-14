@@ -4,7 +4,7 @@ import pytest
 
 from render.beatmap import ParseBeatmap
 from render.catch import (BANANA, DROPLET, FRUIT, TINY_DROPLET, ApplyMods, BuildCatchBeatmap, CatcherTrack, CatchWidth,
-                          JudgeReplay, LegacyRandom, TimePreempt)
+                          FindImpossibleMovement, JudgeReplay, LegacyRandom, TimePreempt)
 from render.replay import CatchFrame, ParseReplay, ReplayMods
 
 MAP_TEMPLATE = """osu file format v14
@@ -126,3 +126,29 @@ def test_real_replay_matches_its_own_judgement_counts():
     assert judgements.misses == replay.count_miss
     assert judgements.tiny_missed == replay.count_katu
     assert judgements.max_combo == replay.max_combo
+    assert FindImpossibleMovement(catch_beatmap, replay.frames) is None
+
+    edited = list(replay.frames)
+    middle = len(edited) // 2
+    far_side = 0 if edited[middle].x > 256 else 512
+    edited[middle] = CatchFrame(edited[middle].time, far_side, edited[middle].dashing)
+    assert FindImpossibleMovement(catch_beatmap, edited) is not None
+
+
+def test_normal_movement_is_allowed():
+    catch_beatmap = BuildCatchBeatmap(MakeMap(["100,192,1000,1,0", "400,192,2000,1,0"]), ReplayMods())
+    frames = [CatchFrame(t, 100 + min(max(t - 1000, 0), 300) * 0.3, False) for t in range(0, 2500, 16)]
+    assert FindImpossibleMovement(catch_beatmap, frames) is None
+
+
+def test_teleporting_catcher_is_flagged():
+    catch_beatmap = BuildCatchBeatmap(MakeMap(["100,192,1000,1,0", "400,192,3000,1,0"]), ReplayMods())
+    frames = [CatchFrame(t, 100 if t < 1500 else 450, True) for t in range(0, 2500, 16)]
+    assert FindImpossibleMovement(catch_beatmap, frames) is not None
+
+
+def test_hyperdash_speed_is_allowed():
+    catch_beatmap = BuildCatchBeatmap(MakeMap(["0,192,1000,1,0", "512,192,1200,1,0"]), ReplayMods())
+    assert catch_beatmap.objects[0].hyper_target is not None
+    frames = [CatchFrame(t, min(max((t - 1000) * 2.56, 0), 512), True) for t in range(0, 1600, 16)]
+    assert FindImpossibleMovement(catch_beatmap, frames) is None

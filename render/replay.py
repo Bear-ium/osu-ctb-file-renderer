@@ -10,7 +10,7 @@ from render.errors import ReplayError
 
 MAX_REPLAY_BYTES = 5 * 1024 * 1024
 MAX_REPLAY_DATA_BYTES = 8 * 1024 * 1024
-MAX_FRAMES = 400_000
+MAX_FRAMES = 200_000
 MAX_ULEB128_BYTES = 5
 PLAYFIELD_WIDTH = 512
 SEED_FRAME_DELTA = -12345
@@ -172,9 +172,9 @@ def DecompressReplayData(compressed):
 
 
 def ParseFrameText(text):
-    events = text.rstrip(",").split(",")
-    if len(events) > MAX_FRAMES:
+    if text.count(",") > MAX_FRAMES + 1:
         raise ReplayError("The replay contains far more movement data than any real play.")
+    events = text.rstrip(",").split(",")
     frames = []
     for index, event in enumerate(events):
         parts = event.split("|")

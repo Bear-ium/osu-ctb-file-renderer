@@ -9,7 +9,8 @@ from bot.main import RenderQueue, SafeName
 from render.beatmap import ParseBeatmap
 from render.catch import BuildCatchBeatmap
 from render.errors import BeatmapError, ReplayError
-from render.replay import MAX_REPLAY_DATA_BYTES, ParseReplay, ReplayMods
+from render.curves import PathBudget, SliderPath
+from render.replay import MAX_FRAMES, MAX_REPLAY_DATA_BYTES, ParseReplay, ReplayMods
 from tests.test_catch import MAP_TEMPLATE
 
 FRAMES = b"0|256|-500|0,-1|256|-500|0,16|250|0|0,17|240|0|1,"
@@ -143,3 +144,17 @@ def test_cooldown_starts_at_request_time():
     queue.active_users.discard(1)
     queue.pending -= 1
     assert "Slow down" in queue.TryReserve(1)
+
+
+def test_frame_count_is_checked_before_splitting(tmp_path):
+    frames = b"16|250|0|0," * (MAX_FRAMES + 10)
+    with pytest.raises(ReplayError, match="far more movement data"):
+        ParseReplay(Write(tmp_path, BuildOsr(lzma.compress(frames, format=lzma.FORMAT_ALONE))))
+
+
+def test_path_budget_is_shared_across_sliders():
+    budget = PathBudget(max_work=10_000)
+    wiggly = [(((i * 7919) % 500, (i * 104729) % 380), "B" if i == 0 else None) for i in range(40)]
+    with pytest.raises(BeatmapError, match="too complex"):
+        for _ in range(50):
+            SliderPath(wiggly, None, budget)

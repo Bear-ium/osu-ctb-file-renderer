@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from render.beatmap import Difficulty
-from render.curves import SliderPath
+from render.curves import PathBudget, SliderPath
 from render.errors import BeatmapError
 
 PLAYFIELD_WIDTH = 512
@@ -45,6 +45,7 @@ class ObjectBudget:
 
     def __init__(self, limit=MAX_OBJECTS):
         self.remaining = limit
+        self.paths = PathBudget()
 
     def Take(self, count=1):
         self.remaining -= count
@@ -187,7 +188,7 @@ def BuildJuiceStream(beatmap, hit_object, colour_index, budget):
     scoring_distance = velocity * timing_point.beat_length
     tick_distance = scoring_distance / beatmap.difficulty.slider_tick_rate * tick_distance_multiplier
 
-    path = SliderPath(hit_object.control_points, hit_object.expected_distance)
+    path = SliderPath(hit_object.control_points, hit_object.expected_distance, budget.paths)
     span_count = hit_object.repeat_count + 1
     head_x = min(max(hit_object.x, 0), PLAYFIELD_WIDTH)
     parent = ParentObject("juice_stream", hit_object.time, hit_object.x)
@@ -457,3 +458,50 @@ def JudgeReplay(catch_beatmap, track):
         judgements.combo_at.append(combo)
         judgements.accuracy_at.append(hits / total)
     return judgements
+
+
+MOVEMENT_WINDOW_MS = 100
+MOVEMENT_TOLERANCE = 1.5
+MOVEMENT_SLACK_PX = 30
+HYPER_MARGIN_MS = 50
+BASE_WALK_SPEED = 0.5
+
+
+def FindImpossibleMovement(catch_beatmap, frames):
+    """Return the time of the first stretch where the catcher moves faster than osu!catch allows, or None.
+
+    Speeds are checked over windows of at least MOVEMENT_WINDOW_MS, because frame times are rounded to whole
+    milliseconds and short gaps exaggerate speed. Anywhere near a hyperdash fruit is skipped, caught or not.
+    """
+    hyper_windows = []
+    for window_start, window_end in sorted(
+        (obj.time - HYPER_MARGIN_MS, obj.hyper_target.time + HYPER_MARGIN_MS)
+        for obj in catch_beatmap.objects if obj.hyper_target is not None
+    ):
+        if hyper_windows and window_start <= hyper_windows[-1][1]:
+            hyper_windows[-1][1] = max(hyper_windows[-1][1], window_end)
+        else:
+            hyper_windows.append([window_start, window_end])
+    hyper_starts = [start for start, _ in hyper_windows]
+
+    def NearHyperdash(start, end):
+        index = bisect.bisect_right(hyper_starts, end) - 1
+        return index >= 0 and hyper_windows[index][1] >= start
+
+    allowed_before = [0.0]
+    for previous, current in zip(frames, frames[1:]):
+        speed = BASE_DASH_SPEED if previous.dashing or current.dashing else BASE_WALK_SPEED
+        allowed_before.append(allowed_before[-1] + speed * (current.time - previous.time))
+
+    end = 0
+    for start in range(len(frames)):
+        end = max(end, start + 1)
+        while end < len(frames) and frames[end].time - frames[start].time < MOVEMENT_WINDOW_MS:
+            end += 1
+        if end >= len(frames):
+            break
+        distance = abs(frames[end].x - frames[start].x)
+        allowed = (allowed_before[end] - allowed_before[start]) * MOVEMENT_TOLERANCE + MOVEMENT_SLACK_PX
+        if distance > allowed and not NearHyperdash(frames[start].time, frames[end].time):
+            return frames[start].time
+    return None

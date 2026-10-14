@@ -71,6 +71,17 @@ CTB_SAMPLE_OSR=path/to/replay.osr CTB_SAMPLE_OSU=path/to/map.osu python -m pytes
 
 Rendering is CPU-heavy and Railway bills CPU by usage, so renders cost money while an idle bot costs very little. Start with `MAX_CONCURRENT_RENDERS=1`. Each render logs its duration and peak memory, so you can tune the limits from real numbers. The free plan's resource limits are tight for video encoding, so plan on Hobby. Check Railway's current pricing before committing. The account also needs to be out of the limited trial, because restricted outbound networking can stop the bot connecting to Discord.
 
+## What happens to uploads
+
+Uploaded files are treated as untrusted data. They are never run, opened by another program or sent anywhere.
+
+- Only `.osr` files up to 5 MB are accepted. Each one is saved under a fixed name in a private temp folder and deleted after the render, whatever the outcome.
+- The bot reads replays with its own strict parser. Every length, count and number is bounded, and the compressed movement data can't unpack past 8 MB. Anything that doesn't parse as an osu!catch replay is rejected.
+- The beatmap hash in the replay has to match a real map on osu!, and the downloaded `.osu` file has to match that hash.
+- Beatmaps are parsed with osu!'s own number limits, and there are caps on objects, slider complexity and file size. A hostile map can't exhaust memory or CPU, and every render is killed if it passes the time limit.
+- Replays where the catcher moves more than 1.5x faster than osu!catch allows (outside hyperdashes) are rejected as edited. This catches teleporting and hand-edited movement. It can't prove a replay is legitimate, for example a cheat that moves within the game's speed limits.
+- The only thing from the upload that is shown back is the player name, with mentions and Markdown escaped. The bot never re-shares the uploaded file itself.
+
 ## Known limitations
 
 - No audio yet. That needs the full beatmap set, not just the `.osu` file.

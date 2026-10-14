@@ -2,8 +2,8 @@ import logging
 import time
 
 from render.beatmap import ParseBeatmap
-from render.catch import BuildCatchBeatmap, CatcherTrack, JudgeReplay
-from render.errors import BeatmapError
+from render.catch import BuildCatchBeatmap, CatcherTrack, FindImpossibleMovement, JudgeReplay
+from render.errors import BeatmapError, ReplayError
 from render.lookup import FetchBeatmap, Md5
 from render.replay import ParseReplay
 from render.video import FrameRenderer, RenderVideo
@@ -28,6 +28,10 @@ def RenderReplay(replay_path, output_path, cache_dir, api, max_bytes, osu_file=N
     beatmap = ParseBeatmap(data.decode("utf-8-sig", errors="replace"))
 
     catch_beatmap = BuildCatchBeatmap(beatmap, replay.mods)
+    impossible_at = FindImpossibleMovement(catch_beatmap, replay.frames)
+    if impossible_at is not None:
+        log.warning("Rejected replay by %s: impossible movement at %.0f ms", replay.username, impossible_at)
+        raise ReplayError("This replay moves the catcher faster than osu!catch allows, so it looks edited. It can't be rendered.")
     track = CatcherTrack(replay.frames)
     judgements = JudgeReplay(catch_beatmap, track)
     log.info("%s - %s [%s] played by %s: %d objects, %d misses, max combo %d (replay says %d misses, %dx)",

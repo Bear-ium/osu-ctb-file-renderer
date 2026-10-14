@@ -9,6 +9,25 @@ CATMULL_DETAIL = 50
 CIRCULAR_ARC_TOLERANCE = 0.1
 FLOAT_EPSILON = 1e-3
 MAX_PATH_VERTICES = 250_000
+MAX_TOTAL_PATH_VERTICES = 2_000_000
+MAX_TOTAL_PATH_WORK = 30_000_000
+
+
+class PathBudget:
+    """Bounds the work and memory spent approximating slider paths across a whole beatmap.
+
+    Work is counted before it's done: a Bezier step on n control points costs about n * n.
+    """
+
+    def __init__(self, max_work=MAX_TOTAL_PATH_WORK, max_vertices=MAX_TOTAL_PATH_VERTICES):
+        self.work_left = max_work
+        self.vertices_left = max_vertices
+
+    def Spend(self, work=0, vertices=0):
+        self.work_left -= work
+        self.vertices_left -= vertices
+        if self.work_left < 0 or self.vertices_left < 0:
+            raise BeatmapError("The beatmap's sliders are too complex to render.")
 
 
 def CheckVertexCount(count):
@@ -58,12 +77,14 @@ def BezierApproximate(points, output):
         output.append((0.25 * (a[0] + 2 * b[0] + c[0]), 0.25 * (a[1] + 2 * b[1] + c[1])))
 
 
-def BezierToPiecewiseLinear(points):
+def BezierToPiecewiseLinear(points, budget):
     if len(points) < 2:
         return list(points)
     output = []
     to_flatten = [list(points)]
+    step_cost = len(points) * len(points)
     while to_flatten:
+        budget.Spend(work=step_cost)
         parent = to_flatten.pop()
         if BezierIsFlatEnough(parent):
             BezierApproximate(parent, output)
@@ -86,7 +107,8 @@ def CatmullFindPoint(v1, v2, v3, v4, t):
     )
 
 
-def CatmullToPiecewiseLinear(points):
+def CatmullToPiecewiseLinear(points, budget):
+    budget.Spend(work=(len(points) - 1) * CATMULL_DETAIL * 2)
     result = []
     for i in range(len(points) - 1):
         v1 = points[i - 1] if i > 0 else points[i]
@@ -133,12 +155,13 @@ def CircularArcPointCount(radius, theta_range):
     return max(2, math.ceil(theta_range / (2 * math.acos(1 - CIRCULAR_ARC_TOLERANCE / radius))))
 
 
-def CircularArcToPiecewiseLinear(points):
+def CircularArcToPiecewiseLinear(points, budget):
     properties = CircularArcProperties(points)
     if properties is None:
-        return BezierToPiecewiseLinear(points)
+        return BezierToPiecewiseLinear(points, budget)
     centre, radius, theta_start, theta_range, direction = properties
     amount = CircularArcPointCount(radius, theta_range)
+    budget.Spend(work=amount)
     output = []
     for i in range(amount):
         theta = theta_start + direction * (i / (amount - 1)) * theta_range
@@ -146,21 +169,23 @@ def CircularArcToPiecewiseLinear(points):
     return output
 
 
-def SubPath(points, path_type):
+def SubPath(points, path_type, budget):
     if path_type == "L":
+        budget.Spend(work=len(points))
         return list(points)
     if path_type == "P" and len(points) == 3:
         properties = CircularArcProperties(points)
         if properties is not None and CircularArcPointCount(properties[1], properties[3]) < 1000:
-            return CircularArcToPiecewiseLinear(points)
+            return CircularArcToPiecewiseLinear(points, budget)
     if path_type == "C":
-        return CatmullToPiecewiseLinear(points)
-    return BezierToPiecewiseLinear(points)
+        return CatmullToPiecewiseLinear(points, budget)
+    return BezierToPiecewiseLinear(points, budget)
 
 
 class SliderPath:
-    def __init__(self, control_points, expected_distance=None):
+    def __init__(self, control_points, expected_distance=None, budget=None):
         """control_points: list of ((x, y), type or None), positions relative to the slider head."""
+        self.budget = budget or PathBudget()
         self.path = []
         self.cumulative_length = []
         self.CalculatePath(control_points)
@@ -179,9 +204,10 @@ class SliderPath:
             if len(segment) == 1:
                 self.path.append(segment[0])
             elif len(segment) > 1:
-                sub_path = SubPath(segment, segment_type)
+                sub_path = SubPath(segment, segment_type, self.budget)
                 skip_first = bool(self.path) and bool(sub_path) and self.path[-1] == sub_path[0]
                 self.path.extend(sub_path[1:] if skip_first else sub_path)
+                self.budget.Spend(vertices=len(sub_path))
                 CheckVertexCount(len(self.path))
             start = i
 
