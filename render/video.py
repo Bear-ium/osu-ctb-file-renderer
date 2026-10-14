@@ -25,6 +25,12 @@ MAX_VIDEO_SECONDS = 20 * 60
 MIN_BITRATE_KBPS = 150
 MAX_BITRATE_KBPS = 6000
 SIZE_SAFETY = 0.9
+AUDIO_KBPS = 128
+AUDIO_OVERHEAD = 1.05
+AUDIO_SAMPLE_RATE = 44100
+AUDIO_FADE_SECONDS = 1.5
+AUDIO_PROBE_SECONDS = 3
+VIDEO_TUNE = "animation"
 POP_MS = 160
 MISS_MARK_MS = 400
 TRAIL_OFFSETS_MS = (90, 60, 30)
@@ -316,25 +322,66 @@ class FrameRenderer:
         return frame
 
 
-def TargetBitrateKbps(max_bytes, duration_seconds):
-    kbps = max_bytes * SIZE_SAFETY * 8 / duration_seconds / 1000
+def TargetBitrateKbps(max_bytes, duration_seconds, audio_kbps=0):
+    """Video bitrate that fits max_bytes once the audio stream and its container overhead are paid for."""
+    total_kbps = max_bytes * SIZE_SAFETY * 8 / duration_seconds / 1000
+    kbps = total_kbps - audio_kbps * AUDIO_OVERHEAD
     return int(min(max(kbps, MIN_BITRATE_KBPS), MAX_BITRATE_KBPS))
+
+
+def AudioFilter(start_time_ms, rate, nightcore, duration_seconds):
+    """ffmpeg filter that lines the song up with the video: map time t appears at video time (t - start) / rate."""
+    filters = [f"aresample={AUDIO_SAMPLE_RATE}"]
+    if start_time_ms >= 0:
+        filters += [f"atrim=start={start_time_ms / 1000:.3f}", "asetpts=PTS-STARTPTS"]
+    else:
+        filters.append(f"adelay={round(abs(start_time_ms))}:all=1")
+    if rate != 1:
+        if nightcore:
+            filters += [f"asetrate={AUDIO_SAMPLE_RATE}*{rate:g}", f"aresample={AUDIO_SAMPLE_RATE}"]
+        else:
+            filters.append(f"atempo={rate:g}")
+    fade_start = max(duration_seconds - AUDIO_FADE_SECONDS, 0)
+    filters += [f"afade=t=out:st={fade_start:.3f}:d={AUDIO_FADE_SECONDS:g}", "apad"]
+    return ",".join(filters)
 
 
 def EncoderArgs(bitrate_kbps):
     return [
-        "-c:v", "libx264", "-preset", "veryfast", "-tune", "animation", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", "veryfast", "-tune", VIDEO_TUNE, "-pix_fmt", "yuv420p",
         "-b:v", f"{bitrate_kbps}k", "-maxrate", f"{int(bitrate_kbps * 1.5)}k", "-bufsize", f"{bitrate_kbps * 2}k",
         "-g", str(FPS * 2), "-movflags", "+faststart",
     ]
 
 
-def EncodeFrames(renderer, output_path, bitrate_kbps):
+def AudioInputArgs(audio_path):
+    """Only allow local file access, so a crafted audio file can't make ffmpeg open network or other protocols."""
+    return ["-protocol_whitelist", "file", "-i", audio_path]
+
+
+def AudioDecodes(audio_path):
+    command = [FfmpegPath(), "-hide_banner", "-loglevel", "error", *AudioInputArgs(audio_path),
+               "-t", str(AUDIO_PROBE_SECONDS), "-map", "0:a:0", "-f", "null", "-"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return False
+    if result.returncode != 0:
+        log.warning("Audio file doesn't decode: %s", result.stderr.strip()[-300:])
+    return result.returncode == 0
+
+
+def EncodeFrames(renderer, output_path, bitrate_kbps, audio_path=None):
     command = [
         FfmpegPath(), "-hide_banner", "-loglevel", "error", "-y",
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{WIDTH}x{HEIGHT}", "-r", str(FPS), "-i", "-",
-        *EncoderArgs(bitrate_kbps), output_path,
     ]
+    if audio_path:
+        mods = renderer.replay.mods
+        audio_filter = AudioFilter(renderer.start_time, mods.rate, mods.nightcore, renderer.duration_seconds)
+        command += [*AudioInputArgs(audio_path), "-map", "0:v", "-map", "1:a:0", "-filter:a", audio_filter,
+                    "-c:a", "aac", "-b:a", f"{AUDIO_KBPS}k", "-ar", str(AUDIO_SAMPLE_RATE)]
+    command += [*EncoderArgs(bitrate_kbps), "-t", f"{renderer.duration_seconds:.3f}", output_path]
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         for index in range(renderer.frame_count):
@@ -350,21 +397,37 @@ def EncodeFrames(renderer, output_path, bitrate_kbps):
 
 
 def Transcode(source_path, output_path, bitrate_kbps):
-    command = [FfmpegPath(), "-hide_banner", "-loglevel", "error", "-y", "-i", source_path, *EncoderArgs(bitrate_kbps), output_path]
+    command = [FfmpegPath(), "-hide_banner", "-loglevel", "error", "-y", "-protocol_whitelist", "file", "-i", source_path,
+               "-map", "0:v", "-map", "0:a?", *EncoderArgs(bitrate_kbps), "-c:a", "copy", output_path]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg re-encode failed: {result.stderr.strip()[-500:]}")
 
 
-def RenderVideo(renderer, output_path, max_bytes):
-    bitrate = TargetBitrateKbps(max_bytes, renderer.duration_seconds)
-    log.info("Rendering %d frames (%.1fs of video) at %d kbps", renderer.frame_count, renderer.duration_seconds, bitrate)
-    EncodeFrames(renderer, output_path, bitrate)
+def RenderVideo(renderer, output_path, max_bytes, audio_path=None):
+    """Encode the video, with the song if one is given. Returns notes for the person who asked."""
+    notes = []
+    if audio_path and not AudioDecodes(audio_path):
+        notes.append("No music: the song file couldn't be read.")
+        audio_path = None
+    audio_kbps = AUDIO_KBPS if audio_path else 0
+    bitrate = TargetBitrateKbps(max_bytes, renderer.duration_seconds, audio_kbps)
+    log.info("Rendering %d frames (%.1fs of video) at %d kbps video%s", renderer.frame_count, renderer.duration_seconds,
+             bitrate, f" + {audio_kbps} kbps audio" if audio_path else ", no audio")
+    try:
+        EncodeFrames(renderer, output_path, bitrate, audio_path)
+    except RuntimeError as error:
+        if not audio_path:
+            raise
+        log.warning("Encoding with audio failed, retrying without it: %s", error)
+        notes.append("No music: the song couldn't be encoded.")
+        bitrate = TargetBitrateKbps(max_bytes, renderer.duration_seconds)
+        EncodeFrames(renderer, output_path, bitrate)
 
     for _ in range(3):
         size = os.path.getsize(output_path)
         if size <= max_bytes:
-            return
+            return notes
         if bitrate <= MIN_BITRATE_KBPS:
             break
         bitrate = max(int(bitrate * max_bytes / size * 0.85), MIN_BITRATE_KBPS)
@@ -374,3 +437,4 @@ def RenderVideo(renderer, output_path, max_bytes):
         os.replace(retry_path, output_path)
     if os.path.getsize(output_path) > max_bytes:
         raise RenderError("The video came out too large to upload, even at the lowest quality.")
+    return notes

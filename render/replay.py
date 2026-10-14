@@ -51,6 +51,7 @@ class ReplayMods:
     half_time: bool = False
     hidden: bool = False
     flashlight: bool = False
+    nightcore: bool = False
 
     @property
     def rate(self):
@@ -62,7 +63,7 @@ class ReplayMods:
 
     def Acronyms(self):
         names = [("EZ", self.easy), ("HD", self.hidden), ("HR", self.hard_rock),
-                 ("DT", self.double_time), ("HT", self.half_time), ("FL", self.flashlight)]
+                 ("NC" if self.nightcore else "DT", self.double_time), ("HT", self.half_time), ("FL", self.flashlight)]
         return [name for name, enabled in names if enabled]
 
 
@@ -154,6 +155,7 @@ def ExtractMods(mods):
         half_time=bool(mods & MOD_HALF_TIME),
         hidden=bool(mods & MOD_HIDDEN),
         flashlight=bool(mods & MOD_FLASHLIGHT),
+        nightcore=bool(mods & MOD_NIGHTCORE),
     )
 
 

@@ -1,6 +1,8 @@
 import logging
 import time
+from dataclasses import dataclass, field
 
+from render.assets import AssetSettings, FetchSetAssets, SetAssets
 from render.beatmap import ParseBeatmap
 from render.catch import BuildCatchBeatmap, CatcherTrack, FindImpossibleMovement, JudgeReplay
 from render.errors import BeatmapError, ReplayError
@@ -9,6 +11,20 @@ from render.replay import ParseReplay
 from render.video import FrameRenderer, RenderVideo
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class RenderOptions:
+    asset_settings: AssetSettings | None = None
+    dim_play: float = 0.7
+    dim_rest: float = 0.4
+    skin_dir: str = ""
+
+
+@dataclass
+class RenderResult:
+    duration_seconds: float
+    notes: list = field(default_factory=list)
 
 
 def LoadBeatmapData(replay, cache_dir, api, osu_file=None):
@@ -22,7 +38,9 @@ def LoadBeatmapData(replay, cache_dir, api, osu_file=None):
     return data, None
 
 
-def RenderReplay(replay_path, output_path, cache_dir, api, max_bytes, osu_file=None):
+def RenderReplay(replay_path, output_path, cache_dir, api, max_bytes, osu_file=None, options=None):
+    """Render a replay to output_path. Song and background are only fetched when options.asset_settings is set."""
+    options = options or RenderOptions()
     started = time.monotonic()
     replay = ParseReplay(replay_path)
     data, info = LoadBeatmapData(replay, cache_dir, api, osu_file)
@@ -39,7 +57,15 @@ def RenderReplay(replay_path, output_path, cache_dir, api, max_bytes, osu_file=N
              beatmap.artist, beatmap.title, beatmap.version, replay.username, len(catch_beatmap.objects),
              judgements.misses, judgements.max_combo, replay.count_miss, replay.max_combo)
 
-    renderer = FrameRenderer(beatmap, catch_beatmap, replay, track, judgements)
-    RenderVideo(renderer, output_path, max_bytes)
+    if options.asset_settings is not None:
+        assets = FetchSetAssets(beatmap, replay.beatmap_hash, info, cache_dir, options.asset_settings, osu_size=len(data))
+    else:
+        assets = SetAssets()
+    try:
+        renderer = FrameRenderer(beatmap, catch_beatmap, replay, track, judgements, background_path=assets.background_path,
+                                 dim_play=options.dim_play, dim_rest=options.dim_rest)
+        notes = assets.notes + RenderVideo(renderer, output_path, max_bytes, assets.audio_path)
+    finally:
+        assets.Cleanup()
     log.info("Render finished in %.1fs", time.monotonic() - started)
-    return renderer.duration_seconds
+    return RenderResult(renderer.duration_seconds, notes)
