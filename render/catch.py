@@ -17,7 +17,7 @@ BASE_SCORING_DISTANCE = 100
 RNG_SEED = 1337
 TAIL_LENIENCY = -36
 MAX_SLIDER_LENGTH = 100000
-MAX_TINY_DROPLETS_PER_STREAM = 20000
+MAX_OBJECTS = 100000
 
 FRUIT = "fruit"
 DROPLET = "droplet"
@@ -38,6 +38,18 @@ class CatchObject:
     @property
     def x(self):
         return min(max(self.original_x + self.x_offset, 0), PLAYFIELD_WIDTH)
+
+
+class ObjectBudget:
+    """Caps how many objects a beatmap may generate, so a hostile map can't exhaust memory."""
+
+    def __init__(self, limit=MAX_OBJECTS):
+        self.remaining = limit
+
+    def Take(self, count=1):
+        self.remaining -= count
+        if self.remaining < 0:
+            raise BeatmapError("The beatmap has too many objects to render.")
 
 
 @dataclass
@@ -130,6 +142,8 @@ def TimePreempt(approach_rate):
 def SliderEvents(start_time, span_duration, velocity, tick_distance, total_distance, span_count):
     length = min(MAX_SLIDER_LENGTH, total_distance)
     tick_distance = min(max(tick_distance, 0), length)
+    if tick_distance > 0 and length / tick_distance > MAX_OBJECTS:
+        raise BeatmapError("The beatmap has a juice stream with too many droplets to render.")
     min_distance_from_end = velocity * 10
 
     yield ("head", start_time, 0.0)
@@ -162,7 +176,7 @@ def SliderEvents(start_time, span_duration, velocity, tick_distance, total_dista
     yield ("tail", start_time + total_duration, float(span_count % 2))
 
 
-def BuildJuiceStream(beatmap, hit_object, colour_index):
+def BuildJuiceStream(beatmap, hit_object, colour_index, budget):
     timing_point = beatmap.TimingPointAt(hit_object.time)
     difficulty_point = beatmap.DifficultyPointAt(hit_object.time)
     slider_velocity = difficulty_point.slider_velocity
@@ -179,8 +193,12 @@ def BuildJuiceStream(beatmap, hit_object, colour_index):
     parent = ParentObject("juice_stream", hit_object.time, hit_object.x)
     parent.path_end_x = hit_object.x + (hit_object.control_points[-1][0][0] if hit_object.control_points else 0)
 
+    def Add(obj):
+        budget.Take()
+        parent.nested.append(obj)
+
     if path.distance <= 0 or velocity <= 0:
-        parent.nested.append(CatchObject(FRUIT, hit_object.time, head_x, colour_index))
+        Add(CatchObject(FRUIT, hit_object.time, head_x, colour_index))
         return parent
 
     span_duration = path.distance / velocity
@@ -195,20 +213,18 @@ def BuildJuiceStream(beatmap, hit_object, colour_index):
                 t = time_between_tiny
                 while t < since_last_tick:
                     tiny_progress = last_event[2] + (t / since_last_tick) * (progress - last_event[2])
-                    parent.nested.append(CatchObject(TINY_DROPLET, t + last_event[1], head_x + path.PositionAt(tiny_progress)[0], colour_index))
-                    if len(parent.nested) > MAX_TINY_DROPLETS_PER_STREAM:
-                        raise BeatmapError("The beatmap has a juice stream too long to render.")
+                    Add(CatchObject(TINY_DROPLET, t + last_event[1], head_x + path.PositionAt(tiny_progress)[0], colour_index))
                     t += time_between_tiny
         last_event = (event_type, event_time, progress)
 
         if event_type == "tick":
-            parent.nested.append(CatchObject(DROPLET, event_time, head_x + path.PositionAt(progress)[0], colour_index))
+            Add(CatchObject(DROPLET, event_time, head_x + path.PositionAt(progress)[0], colour_index))
         elif event_type in ("head", "tail", "repeat"):
-            parent.nested.append(CatchObject(FRUIT, event_time, head_x + path.PositionAt(progress)[0], colour_index))
+            Add(CatchObject(FRUIT, event_time, head_x + path.PositionAt(progress)[0], colour_index))
     return parent
 
 
-def BuildBananaShower(hit_object):
+def BuildBananaShower(hit_object, budget):
     parent = ParentObject("banana_shower", hit_object.time, 256)
     start_time = int(hit_object.time)
     end_time = int(hit_object.end_time)
@@ -217,6 +233,7 @@ def BuildBananaShower(hit_object):
         spacing = F32(spacing / 2)
     if spacing <= 0:
         return parent
+    budget.Take(int((end_time - start_time) / spacing) + 1)
     time = F32(start_time)
     while time <= end_time:
         parent.nested.append(CatchObject(BANANA, time, 0.0))
@@ -317,6 +334,7 @@ class CatchBeatmap:
 
 def BuildCatchBeatmap(beatmap, mods):
     difficulty = ApplyMods(beatmap.difficulty, mods)
+    budget = ObjectBudget()
     parents = []
     combo_index = 0
     last_kind = None
@@ -327,11 +345,12 @@ def BuildCatchBeatmap(beatmap, mods):
         colour_index = combo_index % len(beatmap.combo_colours)
         if hit_object.kind == "circle":
             parent = ParentObject("fruit", hit_object.time, hit_object.x)
+            budget.Take()
             parent.nested.append(CatchObject(FRUIT, hit_object.time, hit_object.x, colour_index))
         elif hit_object.kind == "slider":
-            parent = BuildJuiceStream(beatmap, hit_object, colour_index)
+            parent = BuildJuiceStream(beatmap, hit_object, colour_index, budget)
         else:
-            parent = BuildBananaShower(hit_object)
+            parent = BuildBananaShower(hit_object, budget)
         parents.append(parent)
 
     ApplyPositionOffsets(parents, mods.hard_rock)

@@ -27,19 +27,26 @@ class RenderQueue:
     def __init__(self, config):
         self.config = config
         self.semaphore = asyncio.Semaphore(config.max_concurrent_renders)
-        self.waiting = 0
+        self.pending = 0
         self.running = 0
         self.active_users = set()
         self.last_request = {}
 
-    def RejectReason(self, user_id):
+    def TryReserve(self, user_id):
+        """Claim a queue slot for this user, or return why they can't have one.
+
+        Runs without awaiting, so concurrent requests can't all pass the checks before any of them is counted.
+        """
         if user_id in self.active_users:
             return "You already have a render in progress. Wait for it to finish first."
         elapsed = time.monotonic() - self.last_request.get(user_id, -1e9)
         if elapsed < self.config.user_cooldown_seconds:
             return f"Slow down a bit. You can render again in {int(self.config.user_cooldown_seconds - elapsed) + 1}s."
-        if self.waiting >= self.config.max_queue_length:
+        if self.pending >= self.config.max_queue_length:
             return "The render queue is full right now. Try again in a few minutes."
+        self.active_users.add(user_id)
+        self.last_request[user_id] = time.monotonic()
+        self.pending += 1
         return None
 
 
@@ -90,12 +97,18 @@ async def Reply(interaction, content, file=None):
     if interaction.channel is not None:
         if file is not None:
             file.reset()
-        await interaction.channel.send(content=f"{interaction.user.mention} {content}", file=file)
+        await interaction.channel.send(content=f"{interaction.user.mention} {content}", file=file,
+                                       allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[interaction.user]))
+
+
+def SafeName(name):
+    """Replay usernames come from the uploaded file, so stop them carrying mentions or markdown."""
+    return discord.utils.escape_markdown(discord.utils.escape_mentions(name))[:64]
 
 
 class RenderBot(discord.Client):
     def __init__(self, config):
-        super().__init__(intents=discord.Intents.default())
+        super().__init__(intents=discord.Intents.default(), allowed_mentions=discord.AllowedMentions.none())
         self.config = config
         self.tree = app_commands.CommandTree(self)
         self.queue = RenderQueue(config)
@@ -129,14 +142,14 @@ class RenderBot(discord.Client):
         if attachment.size > MAX_REPLAY_BYTES:
             await Reply(interaction, f"That replay is too large (limit is {MAX_REPLAY_BYTES // (1024 * 1024)} MB).")
             return
-        reason = self.queue.RejectReason(interaction.user.id)
+        user_id = interaction.user.id
+        reason = self.queue.TryReserve(user_id)
         if reason:
             await Reply(interaction, reason)
             return
 
-        user_id = interaction.user.id
-        self.queue.active_users.add(user_id)
         work_dir = tempfile.mkdtemp(prefix="ctb-render-")
+        holds_queue_slot = True
         try:
             replay_path = os.path.join(work_dir, "replay.osr")
             output_path = os.path.join(work_dir, "replay.mp4")
@@ -147,21 +160,19 @@ class RenderBot(discord.Client):
                 await Reply(interaction, str(error))
                 return
 
-            self.queue.last_request[user_id] = time.monotonic()
+            player = SafeName(replay.username)
             max_bytes = self.config.max_upload_bytes
             if getattr(interaction, "filesize_limit", None):
                 max_bytes = min(max_bytes, interaction.filesize_limit)
 
             if self.queue.running >= self.config.max_concurrent_renders:
-                await Reply(interaction, f"Queued replay by **{replay.username}** ({self.queue.waiting + 1} in the queue).")
-            self.queue.waiting += 1
-            try:
-                await self.queue.semaphore.acquire()
-            finally:
-                self.queue.waiting -= 1
+                await Reply(interaction, f"Queued replay by **{player}** ({self.queue.pending} in the queue).")
+            await self.queue.semaphore.acquire()
+            self.queue.pending -= 1
+            holds_queue_slot = False
             self.queue.running += 1
             try:
-                await Reply(interaction, f"Rendering replay by **{replay.username}**...")
+                await Reply(interaction, f"Rendering replay by **{player}**...")
                 started = time.monotonic()
                 error = await RunRender(self.config, replay_path, output_path, max_bytes)
                 log.info("Render for user %s took %.1fs (%s)", user_id, time.monotonic() - started, "ok" if error is None else error)
@@ -172,7 +183,7 @@ class RenderBot(discord.Client):
             if error is not None:
                 await Reply(interaction, error)
                 return
-            await Reply(interaction, f"Replay by **{replay.username}**", file=discord.File(output_path, filename="replay.mp4"))
+            await Reply(interaction, f"Replay by **{player}**", file=discord.File(output_path, filename="replay.mp4"))
         except Exception:
             log.exception("Unexpected error handling /render")
             try:
@@ -180,6 +191,8 @@ class RenderBot(discord.Client):
             except discord.HTTPException:
                 pass
         finally:
+            if holds_queue_slot:
+                self.queue.pending -= 1
             self.queue.active_users.discard(user_id)
             shutil.rmtree(work_dir, ignore_errors=True)
 

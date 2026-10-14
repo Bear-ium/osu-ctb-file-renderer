@@ -8,6 +8,7 @@ from osrparse import GameMode, Mod, Replay
 from render.errors import ReplayError
 
 MAX_REPLAY_BYTES = 5 * 1024 * 1024
+MAX_REPLAY_DATA_BYTES = 32 * 1024 * 1024
 PLAYFIELD_WIDTH = 512
 
 
@@ -105,9 +106,53 @@ def RejectOtherModes(path):
     raise ReplayError(f"Only osu!catch replays are supported (this one is {mode_names[mode]}).")
 
 
+def SkipString(data, offset):
+    marker = data[offset]
+    offset += 1
+    if marker == 0x00:
+        return offset
+    if marker != 0x0B:
+        raise ValueError("bad string marker")
+    length = 0
+    shift = 0
+    while True:
+        byte = data[offset]
+        offset += 1
+        length |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return offset + length
+        shift += 7
+
+
+def CompressedReplayData(data):
+    offset = 5
+    for _ in range(3):
+        offset = SkipString(data, offset)
+    offset += 6 * 2 + 4 + 2 + 1 + 4
+    offset = SkipString(data, offset)
+    offset += 8
+    (length,) = struct.unpack_from("<i", data, offset)
+    offset += 4
+    return data[offset:offset + max(length, 0)]
+
+
+def RejectDecompressionBombs(path):
+    """Unpack the replay data with a size cap before osrparse unpacks it without one."""
+    with open(path, "rb") as file:
+        data = file.read()
+    decompressor = lzma.LZMADecompressor()
+    try:
+        decompressor.decompress(CompressedReplayData(data), max_length=MAX_REPLAY_DATA_BYTES)
+    except (ValueError, struct.error, lzma.LZMAError, IndexError) as error:
+        raise ReplayError("The replay file is corrupt or not a valid `.osr` file.") from error
+    if not decompressor.eof and not decompressor.needs_input:
+        raise ReplayError("The replay contains far more movement data than any real play.")
+
+
 def ParseReplay(path, max_bytes=MAX_REPLAY_BYTES):
     ValidateReplayFile(path, max_bytes)
     RejectOtherModes(path)
+    RejectDecompressionBombs(path)
     try:
         replay = Replay.from_path(path)
     except (ValueError, struct.error, lzma.LZMAError, UnicodeDecodeError, IndexError, EOFError) as error:
