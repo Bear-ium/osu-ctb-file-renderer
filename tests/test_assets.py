@@ -160,7 +160,9 @@ class FakeSession:
         self.routes = routes
         self.requests = []
 
-    def get(self, url, **kwargs):
+    def Get(self, url, address, headers, timeout):
+        assert address in PUBLIC_HOSTS.values() and address == PUBLIC_HOSTS[assets.urlsplit(url).hostname]
+        assert headers["Accept-Encoding"] == "identity"
         self.requests.append(url)
         route = self.routes.get(url)
         if route is None:
@@ -213,7 +215,7 @@ def test_everything_failing_never_raises(tmp_path):
 
 def test_unexpected_errors_never_raise(tmp_path):
     class ExplodingSession:
-        def get(self, url, **kwargs):
+        def Get(self, url, address, headers, timeout):
             raise ZeroDivisionError("boom")
     result = FetchSetAssets(BEATMAP, OSU_HASH, INFO, str(tmp_path / "cache"), SETTINGS, ExplodingSession())
     assert result.audio_path is None and result.notes
@@ -302,3 +304,30 @@ def test_only_osu_members_of_the_known_size_are_read(tmp_path, monkeypatch):
     _, audio, matched = ExtractSetAssets(MakeOsz(tmp_path / "set.osz", members), BEATMAP, OSU_HASH, str(staging), len(OSU_BYTES))
     assert matched and audio is not None
     assert reads == ["map.osu"]
+
+
+def test_pinned_requests_keep_the_real_hostname_for_tls(monkeypatch):
+    sent = {}
+
+    class RecordingSession:
+        trust_env = True
+
+        def mount(self, prefix, adapter):
+            sent["adapter"] = adapter
+
+        def get(self, url, **kwargs):
+            sent.update(url=url, **kwargs)
+            return "response"
+
+    monkeypatch.setattr(assets.requests, "Session", RecordingSession)
+    assert assets.PinnedHttp().Get("https://cdn.example/path/set.osz?sig=a%2Fb", "93.184.216.35", {"User-Agent": "x"}, 5) == "response"
+    assert sent["url"] == "https://93.184.216.35/path/set.osz?sig=a%2Fb"
+    assert sent["headers"]["Host"] == "cdn.example"
+    assert sent["adapter"].hostname == "cdn.example"
+    assert sent["allow_redirects"] is False
+
+
+def test_pinned_adapter_sets_sni_and_certificate_hostname():
+    adapter = assets.PinnedAdapter("cdn.example")
+    assert adapter.poolmanager.connection_pool_kw["server_hostname"] == "cdn.example"
+    assert adapter.poolmanager.connection_pool_kw["assert_hostname"] == "cdn.example"

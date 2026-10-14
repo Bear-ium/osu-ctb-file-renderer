@@ -9,9 +9,10 @@ import tempfile
 import time
 import zipfile
 from dataclasses import dataclass, field
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
+from requests.adapters import HTTPAdapter
 from PIL import Image, ImageOps
 
 from render.lookup import HASH_PATTERN, Md5, SafeCoverUrl
@@ -186,7 +187,10 @@ def ResolveHost(hostname):
 
 
 def CheckPublicHttpsUrl(url):
-    """Refuse anything but HTTPS on the default port to a host that only resolves to public addresses."""
+    """Refuse anything but HTTPS on the default port to a host that only resolves to public addresses.
+
+    Returns the address to connect to, so the connection can't be re-resolved somewhere else afterwards.
+    """
     parts = urlsplit(url)
     if parts.scheme != "https" or not parts.hostname or parts.username or parts.password or parts.port not in (None, 443):
         raise AssetError(f"refusing to fetch {url!r}")
@@ -199,14 +203,42 @@ def CheckPublicHttpsUrl(url):
     for address in addresses:
         if not ipaddress.ip_address(address.split("%")[0]).is_global:
             raise AssetError(f"{parts.hostname} resolves to a non-public address")
+    return sorted(addresses)[0]
+
+
+class PinnedAdapter(HTTPAdapter):
+    """Connects to an address chosen in advance while still checking TLS (SNI and certificate) against the real hostname."""
+
+    def __init__(self, hostname):
+        self.hostname = hostname
+        super().__init__()
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        pool_kwargs["server_hostname"] = self.hostname
+        pool_kwargs["assert_hostname"] = self.hostname
+        super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+
+
+class PinnedHttp:
+    """Makes each request to the exact address that passed CheckPublicHttpsUrl, closing the DNS rebinding gap."""
+
+    def Get(self, url, address, headers, timeout):
+        parts = urlsplit(url)
+        host = f"[{address}]" if ":" in address else address
+        pinned_url = urlunsplit(("https", host, parts.path or "/", parts.query, ""))
+        session = requests.Session()
+        session.trust_env = False
+        session.mount("https://", PinnedAdapter(parts.hostname))
+        return session.get(pinned_url, headers={**headers, "Host": parts.hostname}, stream=True, timeout=timeout,
+                           allow_redirects=False)
 
 
 def OpenUrl(session, url, user_agent):
     """GET with redirects followed by hand, so every hop is checked before it is requested."""
     headers = {"User-Agent": user_agent, "Accept-Encoding": "identity"}
     for _ in range(MAX_REDIRECTS + 1):
-        CheckPublicHttpsUrl(url)
-        response = session.get(url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), headers=headers, allow_redirects=False)
+        address = CheckPublicHttpsUrl(url)
+        response = session.Get(url, address, headers, (CONNECT_TIMEOUT, READ_TIMEOUT))
         if response.status_code in (301, 302, 303, 307, 308):
             location = response.headers.get("Location", "")
             response.close()
@@ -388,7 +420,7 @@ def FetchSetAssets(beatmap, replay_hash, info, cache_dir, settings, session=None
     osu_size is the byte length of the replay's verified .osu, used to skip reading other difficulties.
     """
     try:
-        return FetchSetAssetsUnsafe(beatmap, replay_hash, info, cache_dir, settings, session or requests.Session(), osu_size)
+        return FetchSetAssetsUnsafe(beatmap, replay_hash, info, cache_dir, settings, session or PinnedHttp(), osu_size)
     except Exception:
         log.exception("Fetching the song and background failed")
         return SetAssets(notes=["No music or map background: something went wrong fetching them."])
