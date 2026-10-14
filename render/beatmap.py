@@ -12,6 +12,7 @@ MAX_PARSE_VALUE = 2**31 - 1
 MAX_COORDINATE_VALUE = 131072
 MAX_HIT_OBJECTS = 100_000
 MAX_CONTROL_POINTS = 2048
+MAX_EVENT_LINES = 5000
 
 
 def ParseNumber(text, limit=MAX_PARSE_VALUE, allow_nan=False):
@@ -75,6 +76,11 @@ class Beatmap:
     difficulty_points: list
     hit_objects: list
     combo_colours: list
+    audio_filename: str = ""
+    audio_lead_in: float = 0
+    background_filename: str = ""
+    breaks: list = field(default_factory=list)
+    beatmapset_id: int = 0
 
     def TimingPointAt(self, time):
         if not self.timing_points:
@@ -199,6 +205,34 @@ def ParseHitObject(line, offset, format_version):
     return None
 
 
+def SafeFilename(value):
+    """Return a plain basename from a .osu filename value, or "" if it could point anywhere else."""
+    name = value.strip().strip('"').strip()
+    if not name or "/" in name or "\\" in name or ".." in name or ":" in name or "\0" in name:
+        return ""
+    return name
+
+
+def ParseEvents(lines, offset):
+    """Read the background filename and break periods; video and storyboard lines are ignored."""
+    background = ""
+    breaks = []
+    for line in lines:
+        split = [part.strip() for part in line.split(",")]
+        kind = split[0]
+        try:
+            if kind in ("0", "Background") and len(split) >= 3 and not background:
+                background = SafeFilename(split[2])
+            elif kind in ("2", "Break") and len(split) >= 3:
+                start, end = ParseNumber(split[1]) + offset, ParseNumber(split[2]) + offset
+                if end > start:
+                    breaks.append((start, end))
+        except ValueError:
+            continue
+    breaks.sort()
+    return background, breaks
+
+
 def ParseColour(value):
     parts = [int(part.strip()) for part in value.split(",")[:3]]
     return tuple(parts) if len(parts) == 3 else None
@@ -218,6 +252,8 @@ def ParseBeatmap(text):
     values = {}
     timing_lines = []
     hit_object_lines = []
+    event_lines = []
+    events_seen = 0
     colours = {}
     for raw_line in lines[1:]:
         line = raw_line.strip()
@@ -226,7 +262,11 @@ def ParseBeatmap(text):
         if line.startswith("[") and line.endswith("]"):
             section = line[1:-1]
             continue
-        if section == "TimingPoints":
+        if section == "Events":
+            events_seen += 1
+            if events_seen <= MAX_EVENT_LINES and not raw_line.startswith((" ", "_")):
+                event_lines.append(line)
+        elif section == "TimingPoints":
             timing_lines.append(line)
         elif section == "HitObjects":
             hit_object_lines.append(line)
@@ -259,6 +299,15 @@ def ParseBeatmap(text):
     )
 
     timing_points, difficulty_points = ParseTimingPoints(timing_lines, offset)
+    background_filename, breaks = ParseEvents(event_lines, offset)
+    try:
+        audio_lead_in = ParseNumber(values.get(("General", "AudioLeadIn"), "0"))
+    except ValueError:
+        audio_lead_in = 0
+    try:
+        beatmapset_id = int(ParseNumber(values.get(("Metadata", "BeatmapSetID"), "0")))
+    except ValueError:
+        beatmapset_id = 0
 
     if len(hit_object_lines) > MAX_HIT_OBJECTS:
         raise BeatmapError("The beatmap has too many objects to render.")
@@ -286,6 +335,11 @@ def ParseBeatmap(text):
         difficulty_points=difficulty_points,
         hit_objects=hit_objects,
         combo_colours=[colours[k] for k in sorted(colours)] or list(DEFAULT_COMBO_COLOURS),
+        audio_filename=SafeFilename(values.get(("General", "AudioFilename"), "")),
+        audio_lead_in=audio_lead_in,
+        background_filename=background_filename,
+        breaks=breaks,
+        beatmapset_id=max(beatmapset_id, 0),
     )
 
 
