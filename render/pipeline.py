@@ -12,19 +12,20 @@ log = logging.getLogger(__name__)
 
 
 def LoadBeatmapData(replay, cache_dir, api, osu_file=None):
+    """Return the .osu contents and its BeatmapInfo, which is None when the API wasn't used."""
     if osu_file is None:
         return FetchBeatmap(replay.beatmap_hash, cache_dir, api)
     with open(osu_file, "rb") as file:
         data = file.read()
     if Md5(data) != replay.beatmap_hash:
         raise BeatmapError("The .osu file given doesn't match the replay's beatmap hash.")
-    return data
+    return data, None
 
 
 def RenderReplay(replay_path, output_path, cache_dir, api, max_bytes, osu_file=None):
     started = time.monotonic()
     replay = ParseReplay(replay_path)
-    data = LoadBeatmapData(replay, cache_dir, api, osu_file)
+    data, info = LoadBeatmapData(replay, cache_dir, api, osu_file)
     beatmap = ParseBeatmap(data.decode("utf-8-sig", errors="replace"))
 
     catch_beatmap = BuildCatchBeatmap(beatmap, replay.mods)
