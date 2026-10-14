@@ -233,11 +233,14 @@ def BuildBananaShower(hit_object, budget):
         spacing = F32(spacing / 2)
     if spacing <= 0:
         return parent
-    budget.Take(int((end_time - start_time) / spacing) + 1)
     time = F32(start_time)
     while time <= end_time:
+        budget.Take()
         parent.nested.append(CatchObject(BANANA, time, 0.0))
-        time = F32(time + spacing)
+        next_time = F32(time + spacing)
+        if next_time <= time:
+            raise BeatmapError("The beatmap has a spinner too late in the map to render.")
+        time = next_time
     return parent
 
 

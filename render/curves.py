@@ -2,10 +2,18 @@
 import bisect
 import math
 
+from render.errors import BeatmapError
+
 BEZIER_TOLERANCE = 0.25
 CATMULL_DETAIL = 50
 CIRCULAR_ARC_TOLERANCE = 0.1
 FLOAT_EPSILON = 1e-3
+MAX_PATH_VERTICES = 250_000
+
+
+def CheckVertexCount(count):
+    if count > MAX_PATH_VERTICES:
+        raise BeatmapError("The beatmap has a slider too complex to render.")
 
 
 def Sub(a, b):
@@ -59,6 +67,7 @@ def BezierToPiecewiseLinear(points):
         parent = to_flatten.pop()
         if BezierIsFlatEnough(parent):
             BezierApproximate(parent, output)
+            CheckVertexCount(len(output))
             continue
         left, right = BezierSubdivide(parent)
         to_flatten.append(right)
@@ -173,6 +182,7 @@ class SliderPath:
                 sub_path = SubPath(segment, segment_type)
                 skip_first = bool(self.path) and bool(sub_path) and self.path[-1] == sub_path[0]
                 self.path.extend(sub_path[1:] if skip_first else sub_path)
+                CheckVertexCount(len(self.path))
             start = i
 
     def CalculateLength(self, expected_distance):

@@ -8,6 +8,22 @@ from render.errors import BeatmapError
 FIRST_LAZER_VERSION = 128
 EARLY_VERSION_TIMING_OFFSET = 24
 DEFAULT_COMBO_COLOURS = [(255, 192, 0), (0, 202, 0), (18, 124, 255), (242, 24, 57)]
+MAX_PARSE_VALUE = 2**31 - 1
+MAX_COORDINATE_VALUE = 131072
+MAX_HIT_OBJECTS = 100_000
+MAX_CONTROL_POINTS = 2048
+
+
+def ParseNumber(text, limit=MAX_PARSE_VALUE, allow_nan=False):
+    """Parse a number the way osu!'s Parsing class does: bounded, and NaN only where allowed."""
+    value = float(text)
+    if math.isnan(value):
+        if allow_nan:
+            return value
+        raise ValueError("not a number")
+    if abs(value) > limit:
+        raise ValueError("number out of range")
+    return value
 
 
 @dataclass
@@ -134,10 +150,12 @@ def ConvertPathString(point_string, head, format_version):
                 points.append((0.0, 0.0))
             continue
         x_text, y_text = token.split(":")[:2]
-        x, y = float(x_text), float(y_text)
+        x, y = ParseNumber(x_text, MAX_COORDINATE_VALUE), ParseNumber(y_text, MAX_COORDINATE_VALUE)
         if format_version < FIRST_LAZER_VERSION:
             x, y = float(int(x)), float(int(y))
         points.append((x - head[0], y - head[1]))
+        if len(points) > MAX_CONTROL_POINTS:
+            raise BeatmapError("The beatmap has a slider with too many points to render.")
 
     control_points = []
     for i, (path_type, start) in enumerate(segment_starts):
@@ -153,8 +171,8 @@ def ConvertPathString(point_string, head, format_version):
 
 def ParseHitObject(line, offset, format_version):
     split = line.split(",")
-    head = (float(int(float(split[0]))), float(int(float(split[1]))))
-    time = float(split[2]) + offset
+    head = (float(int(ParseNumber(split[0], MAX_COORDINATE_VALUE))), float(int(ParseNumber(split[1], MAX_COORDINATE_VALUE))))
+    time = ParseNumber(split[2]) + offset
     type_flags = int(split[3])
     new_combo = bool(type_flags & 4)
     combo_skip = (type_flags >> 4) & 7
@@ -165,7 +183,7 @@ def ParseHitObject(line, offset, format_version):
             raise BeatmapError("The beatmap has a slider with an impossible repeat count.")
         expected_distance = None
         if len(split) > 7:
-            expected_distance = max(0.0, float(split[7]))
+            expected_distance = max(0.0, ParseNumber(split[7], MAX_COORDINATE_VALUE))
             if expected_distance == 0:
                 expected_distance = None
         return HitObject(
@@ -174,7 +192,7 @@ def ParseHitObject(line, offset, format_version):
             expected_distance=expected_distance, repeat_count=max(0, repeat_count - 1),
         )
     if type_flags & 8:
-        end_time = max(time, float(split[5]) + offset)
+        end_time = max(time, ParseNumber(split[5]) + offset)
         return HitObject(kind="spinner", time=time, x=256, new_combo=new_combo, combo_skip=combo_skip, end_time=end_time)
     if type_flags & 1:
         return HitObject(kind="circle", time=time, x=head[0], new_combo=new_combo, combo_skip=combo_skip)
@@ -223,25 +241,27 @@ def ParseBeatmap(text):
             else:
                 values[(section, key)] = value
 
-    def Number(section_name, key, default):
+    def Number(section_name, key, default, low, high):
         try:
-            return float(values[(section_name, key)])
+            value = ParseNumber(values[(section_name, key)])
         except (KeyError, ValueError):
-            return default
+            value = default
+        return min(max(value, low), high)
 
-    circle_size = Number("Difficulty", "CircleSize", 5)
-    overall = Number("Difficulty", "OverallDifficulty", 5)
+    overall = Number("Difficulty", "OverallDifficulty", 5, 0, 10)
     difficulty = Difficulty(
-        hp=Number("Difficulty", "HPDrainRate", 5),
-        circle_size=circle_size,
+        hp=Number("Difficulty", "HPDrainRate", 5, 0, 10),
+        circle_size=Number("Difficulty", "CircleSize", 5, 0, 10),
         overall=overall,
-        approach_rate=Number("Difficulty", "ApproachRate", overall),
-        slider_multiplier=Number("Difficulty", "SliderMultiplier", 1.4),
-        slider_tick_rate=Number("Difficulty", "SliderTickRate", 1),
+        approach_rate=Number("Difficulty", "ApproachRate", overall, 0, 10),
+        slider_multiplier=Number("Difficulty", "SliderMultiplier", 1.4, 0.4, 3.6),
+        slider_tick_rate=Number("Difficulty", "SliderTickRate", 1, 0.5, 8),
     )
 
     timing_points, difficulty_points = ParseTimingPoints(timing_lines, offset)
 
+    if len(hit_object_lines) > MAX_HIT_OBJECTS:
+        raise BeatmapError("The beatmap has too many objects to render.")
     hit_objects = []
     for line in hit_object_lines:
         try:
@@ -256,7 +276,7 @@ def ParseBeatmap(text):
 
     return Beatmap(
         format_version=format_version,
-        mode=int(Number("General", "Mode", 0)),
+        mode=int(Number("General", "Mode", 0, 0, 3)),
         title=values.get(("Metadata", "Title"), "Unknown title"),
         artist=values.get(("Metadata", "Artist"), "Unknown artist"),
         version=values.get(("Metadata", "Version"), ""),
@@ -275,8 +295,8 @@ def ParseTimingPoints(lines, offset):
     for order, line in enumerate(lines):
         split = line.split(",")
         try:
-            time = float(split[0]) + offset
-            beat_length = float(split[1])
+            time = ParseNumber(split[0]) + offset
+            beat_length = ParseNumber(split[1], allow_nan=True)
         except (ValueError, IndexError):
             continue
         timing_change = len(split) < 7 or split[6].strip()[:1] == "1"

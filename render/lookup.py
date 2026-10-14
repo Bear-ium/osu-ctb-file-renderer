@@ -14,6 +14,7 @@ TOKEN_URL = "https://osu.ppy.sh/oauth/token"
 LOOKUP_URL = "https://osu.ppy.sh/api/v2/beatmaps/lookup"
 OSU_FILE_URL = "https://osu.ppy.sh/osu/{beatmap_id}"
 REQUEST_TIMEOUT = 20
+MAX_OSU_FILE_BYTES = 16 * 1024 * 1024
 HASH_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 
@@ -64,12 +65,19 @@ class OsuApi:
 
     def DownloadOsuFile(self, beatmap_id):
         try:
-            response = self.session.get(OSU_FILE_URL.format(beatmap_id=beatmap_id), timeout=REQUEST_TIMEOUT)
+            with self.session.get(OSU_FILE_URL.format(beatmap_id=beatmap_id), timeout=REQUEST_TIMEOUT, stream=True) as response:
+                if response.status_code != 200:
+                    raise BeatmapError("The beatmap file isn't available from osu! (it may have been deleted).")
+                data = bytearray()
+                for chunk in response.iter_content(chunk_size=65536):
+                    data += chunk
+                    if len(data) > MAX_OSU_FILE_BYTES:
+                        raise BeatmapError("The beatmap file is too large to render.")
         except requests.RequestException as error:
             raise BeatmapError("Couldn't download the beatmap from osu!. Try again in a bit.") from error
-        if response.status_code != 200 or not response.content:
+        if not data:
             raise BeatmapError("The beatmap file isn't available from osu! (it may have been deleted).")
-        return response.content
+        return bytes(data)
 
 
 def CachedBeatmapPath(cache_dir, beatmap_hash):
