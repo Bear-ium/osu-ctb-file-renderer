@@ -34,6 +34,7 @@ class CatchObject:
     x_offset: float = 0.0
     hyper_target: "CatchObject | None" = None
     caught: bool = False
+    index_in_beatmap: int = 0
 
     @property
     def x(self):
@@ -355,6 +356,8 @@ def BuildCatchBeatmap(beatmap, mods):
             parent = BuildJuiceStream(beatmap, hit_object, colour_index, budget)
         else:
             parent = BuildBananaShower(hit_object, budget)
+        for nested in parent.nested:
+            nested.index_in_beatmap = len(parents)
         parents.append(parent)
 
     ApplyPositionOffsets(parents, mods.hard_rock)

@@ -8,6 +8,7 @@ from render.catch import BuildCatchBeatmap, CatcherTrack, FindImpossibleMovement
 from render.errors import BeatmapError, ReplayError
 from render.lookup import FetchBeatmap, Md5
 from render.replay import ParseReplay
+from render.skin import LoadSkin
 from render.video import FrameRenderer, RenderVideo
 
 log = logging.getLogger(__name__)
@@ -63,7 +64,7 @@ def RenderReplay(replay_path, output_path, cache_dir, api, max_bytes, osu_file=N
         assets = SetAssets()
     try:
         renderer = FrameRenderer(beatmap, catch_beatmap, replay, track, judgements, background_path=assets.background_path,
-                                 dim_play=options.dim_play, dim_rest=options.dim_rest)
+                                 dim_play=options.dim_play, dim_rest=options.dim_rest, skin=LoadSkin(options.skin_dir))
         notes = assets.notes + RenderVideo(renderer, output_path, max_bytes, assets.audio_path)
     finally:
         assets.Cleanup()

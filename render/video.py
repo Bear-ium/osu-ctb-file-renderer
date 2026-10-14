@@ -6,6 +6,7 @@ import subprocess
 from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
 
 from render.catch import BANANA, DROPLET, FRUIT, PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH, TINY_DROPLET, CATCHER_BASE_SIZE
+from render import skin as skinning
 from render.errors import RenderError
 from render.ffmpeg import FfmpegPath
 
@@ -144,8 +145,11 @@ def RestIntervals(beatmap, catch_beatmap):
 
 
 class FrameRenderer:
-    def __init__(self, beatmap, catch_beatmap, replay, track, judgements, background_path=None, dim_play=0.7, dim_rest=0.4):
+    def __init__(self, beatmap, catch_beatmap, replay, track, judgements, background_path=None, dim_play=0.7, dim_rest=0.4,
+                 skin=None):
         self.beatmap = beatmap
+        self.skin = skin
+        self.facing = 1
         self.catch = catch_beatmap
         self.replay = replay
         self.track = track
@@ -190,22 +194,54 @@ class FrameRenderer:
 
     def BuildSprites(self):
         self.sprites = {}
-        colours = self.beatmap.combo_colours
-        for index, colour in enumerate(colours):
+        if self.skin is not None:
+            self.BuildSkinSprites()
+        else:
+            colours = self.beatmap.combo_colours
+            for index, colour in enumerate(colours):
+                for hyper in (False, True):
+                    glow = HYPER_COLOUR if hyper else None
+                    self.sprites[(FRUIT, index, hyper, 0)] = CircleSprite(self.fruit_diameter, colour, glow=glow)
+                    self.sprites[(DROPLET, index, hyper, 0)] = CircleSprite(self.fruit_diameter * 0.55, colour, glow=glow)
+                self.sprites[(TINY_DROPLET, index, False, 0)] = CircleSprite(self.fruit_diameter * 0.3, colour)
+            self.sprites[(BANANA, 0, False, 0)] = CircleSprite(self.fruit_diameter * 0.8, BANANA_COLOUR)
+
+        catcher_texture = self.skin.Texture("fruit-catcher-idle", animated_first=True) if self.skin is not None else None
+        if catcher_texture is not None:
+            catch_width_px = self.catch.catch_width * SCALE
+            normal, self.catcher_lift = skinning.CatcherSprite(catcher_texture, catch_width_px)
+            hyper, _ = skinning.CatcherSprite(catcher_texture, catch_width_px, HYPER_COLOUR)
+        else:
+            catcher_width = CATCHER_BASE_SIZE * self.catch.object_scale * 2 * SCALE
+            normal, hyper = CatcherSprite(catcher_width, CATCHER_COLOUR), CatcherSprite(catcher_width, HYPER_COLOUR)
+            self.catcher_lift = 0
+        self.catcher_sprites = {}
+        self.trail_sprites = {}
+        for is_hyper, sprite in ((False, normal), (True, hyper)):
+            for facing, image in ((1, sprite), (-1, ImageOps.mirror(sprite))):
+                self.catcher_sprites[(is_hyper, facing)] = image
+                self.trail_sprites[(is_hyper, facing)] = [WithAlpha(image, alpha) for alpha in (0.15, 0.25, 0.35)]
+
+    def BuildSkinSprites(self):
+        """Skinned pieces, sized as osu! sizes them: texture size times the object scale, droplets 0.8, tiny droplets 0.4."""
+        unit = self.catch.object_scale * SCALE
+        drop, drop_overlay = self.skin.Texture("fruit-drop"), self.skin.Texture("fruit-drop-overlay")
+        for index, colour in enumerate(self.beatmap.combo_colours):
             for hyper in (False, True):
                 glow = HYPER_COLOUR if hyper else None
-                self.sprites[(FRUIT, index, hyper)] = CircleSprite(self.fruit_diameter, colour, glow=glow)
-                self.sprites[(DROPLET, index, hyper)] = CircleSprite(self.fruit_diameter * 0.55, colour, glow=glow)
-            self.sprites[(TINY_DROPLET, index, False)] = CircleSprite(self.fruit_diameter * 0.3, colour)
-        self.sprites[(BANANA, 0, False)] = CircleSprite(self.fruit_diameter * 0.8, BANANA_COLOUR)
-
-        catcher_width = CATCHER_BASE_SIZE * self.catch.object_scale * 2 * SCALE
-        self.catcher_sprite = CatcherSprite(catcher_width, CATCHER_COLOUR)
-        self.hyper_catcher_sprite = CatcherSprite(catcher_width, HYPER_COLOUR)
-        self.trail_sprites = {
-            hyper: [WithAlpha(sprite, alpha) for alpha in (0.15, 0.25, 0.35)]
-            for hyper, sprite in ((False, self.catcher_sprite), (True, self.hyper_catcher_sprite))
-        }
+                for variant, name in enumerate(skinning.FRUIT_NAMES):
+                    base, overlay = self.skin.Texture(f"fruit-{name}"), self.skin.Texture(f"fruit-{name}-overlay")
+                    self.sprites[(FRUIT, index, hyper, variant)] = skinning.PieceSprite(base, overlay, colour, unit, glow)
+                self.sprites[(DROPLET, index, hyper, 0)] = (
+                    skinning.PieceSprite(drop, drop_overlay, colour, unit * 0.8, glow) if drop is not None
+                    else CircleSprite(self.fruit_diameter * 0.55, colour, glow=glow))
+            self.sprites[(TINY_DROPLET, index, False, 0)] = (
+                skinning.PieceSprite(drop, drop_overlay, colour, unit * 0.4) if drop is not None
+                else CircleSprite(self.fruit_diameter * 0.3, colour))
+        bananas = self.skin.Texture("fruit-bananas")
+        self.sprites[(BANANA, 0, False, 0)] = (
+            skinning.PieceSprite(bananas, self.skin.Texture("fruit-bananas-overlay"), BANANA_COLOUR, unit * 0.8) if bananas is not None
+            else CircleSprite(self.fruit_diameter * 0.8, BANANA_COLOUR))
 
     def BuildTextLayer(self):
         layer = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
@@ -276,9 +312,10 @@ class FrameRenderer:
             y = self.ObjectY(obj, time)
             if y > HEIGHT + self.fruit_diameter:
                 continue
-            hyper = obj.hyper_target is not None and obj.kind != TINY_DROPLET
+            hyper = obj.hyper_target is not None and obj.kind not in (TINY_DROPLET, BANANA)
             colour_index = 0 if obj.kind == BANANA else obj.colour_index
-            sprite = self.sprites[(obj.kind, colour_index, hyper and obj.kind != BANANA)]
+            variant = obj.index_in_beatmap % 4 if obj.kind == FRUIT and self.skin is not None else 0
+            sprite = self.sprites[(obj.kind, colour_index, hyper, variant)]
             frame.paste(sprite, (int(ScreenX(obj.x) - sprite.width / 2), int(y - sprite.height / 2)), sprite)
 
     def DrawPop(self, draw, obj, age):
@@ -291,10 +328,13 @@ class FrameRenderer:
 
     def DrawCatcher(self, frame, time):
         hyper = self.IsHyperdashing(time)
-        sprite = self.hyper_catcher_sprite if hyper else self.catcher_sprite
-        top = int(PLATE_Y)
+        movement = self.track.XAt(time) - self.track.XAt(time - self.ms_per_frame)
+        if abs(movement) > 0.01:
+            self.facing = 1 if movement > 0 else -1
+        sprite = self.catcher_sprites[(hyper, self.facing)]
+        top = int(PLATE_Y) - self.catcher_lift
         if hyper or self.track.DashingAt(time):
-            for trail, offset in zip(self.trail_sprites[hyper], TRAIL_OFFSETS_MS):
+            for trail, offset in zip(self.trail_sprites[(hyper, self.facing)], TRAIL_OFFSETS_MS):
                 past_x = ScreenX(self.track.XAt(time - offset * self.replay.mods.rate))
                 frame.paste(trail, (int(past_x - trail.width / 2), top), trail)
         x = ScreenX(self.track.XAt(time))
