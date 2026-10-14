@@ -3,7 +3,7 @@ import logging
 import os
 import subprocess
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
 
 from render.catch import BANANA, DROPLET, FRUIT, PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH, TINY_DROPLET, CATCHER_BASE_SIZE
 from render.errors import RenderError
@@ -28,10 +28,14 @@ SIZE_SAFETY = 0.9
 POP_MS = 160
 MISS_MARK_MS = 400
 TRAIL_OFFSETS_MS = (90, 60, 30)
+DIM_STEPS = 8
+DIM_FADE_MS = 500
+TEXT_MARGIN = 16
+SIDE_TEXT_WIDTH = PLAYFIELD_LEFT - TEXT_MARGIN * 2
+TEXT_STROKE = 2
+STROKE_COLOUR = (0, 0, 0)
 
 BACKGROUND = (14, 14, 20)
-PLAYFIELD_COLOUR = (24, 24, 34)
-BORDER_COLOUR = (60, 60, 80)
 TEXT_COLOUR = (235, 235, 240)
 MUTED_TEXT = (150, 150, 170)
 BANANA_COLOUR = (255, 220, 60)
@@ -61,10 +65,6 @@ def ScreenX(x):
 
 def Darken(colour, amount):
     return tuple(int(c * amount) for c in colour)
-
-
-def Mix(colour, other, alpha):
-    return tuple(int(a * alpha + b * (1 - alpha)) for a, b in zip(colour, other))
 
 
 def CircleSprite(diameter, colour, outline=None, glow=None):
@@ -107,24 +107,38 @@ def WithAlpha(sprite, factor):
     return faded
 
 
-def WrapText(text, font, max_width):
-    words = text.split()
-    lines = []
-    current = ""
-    for word in words:
-        candidate = f"{current} {word}".strip()
-        if font.getlength(candidate) <= max_width or not current:
-            current = candidate
-        else:
-            lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
-    return lines
+def Truncate(text, font, max_width):
+    """Shorten text with an ellipsis so it fits on one line."""
+    if font.getlength(text) <= max_width:
+        return text
+    while text and font.getlength(text + "…") > max_width:
+        text = text[:-1]
+    return text.rstrip() + "…"
+
+
+def OutlinedText(draw, position, text, font, fill, anchor="la"):
+    draw.text(position, text, font=font, fill=fill, anchor=anchor, stroke_width=TEXT_STROKE, stroke_fill=STROKE_COLOUR)
+
+
+def LoadBackgroundImage(path):
+    if not path:
+        return None
+    try:
+        with Image.open(path) as image:
+            return ImageOps.fit(image.convert("RGB"), (WIDTH, HEIGHT), Image.LANCZOS)
+    except OSError as error:
+        log.warning("Couldn't load background %s: %s", path, error)
+        return None
+
+
+def RestIntervals(beatmap, catch_beatmap):
+    """Map-time stretches where the background is shown lighter: before the first object, breaks, after the last."""
+    first_visible = catch_beatmap.start_time - catch_beatmap.preempt
+    return [(float("-inf"), first_visible), *beatmap.breaks, (catch_beatmap.end_time, float("inf"))]
 
 
 class FrameRenderer:
-    def __init__(self, beatmap, catch_beatmap, replay, track, judgements):
+    def __init__(self, beatmap, catch_beatmap, replay, track, judgements, background_path=None, dim_play=0.7, dim_rest=0.4):
         self.beatmap = beatmap
         self.catch = catch_beatmap
         self.replay = replay
@@ -150,15 +164,18 @@ class FrameRenderer:
         if self.frame_count / FPS > MAX_VIDEO_SECONDS:
             raise RenderError(f"That replay is too long to render (limit is {MAX_VIDEO_SECONDS // 60} minutes).")
 
-        self.title_font = LoadFont(24, bold=True)
-        self.body_font = LoadFont(18)
-        self.label_font = LoadFont(15)
+        self.title_font = LoadFont(22, bold=True)
+        self.body_font = LoadFont(16)
+        self.small_font = LoadFont(14)
+        self.player_font = LoadFont(20, bold=True)
         self.big_font = LoadFont(44, bold=True)
-        self.medium_font = LoadFont(30, bold=True)
+        self.medium_font = LoadFont(22, bold=True)
         self.miss_font = LoadFont(26, bold=True)
 
+        self.rest_intervals = RestIntervals(beatmap, catch_beatmap)
+        self.rest_starts = [start for start, _ in self.rest_intervals]
         self.BuildSprites()
-        self.background = self.BuildBackground()
+        self.backgrounds = self.BuildBackground(LoadBackgroundImage(background_path), dim_play, dim_rest)
 
     @property
     def duration_seconds(self):
@@ -183,41 +200,52 @@ class FrameRenderer:
             for hyper, sprite in ((False, self.catcher_sprite), (True, self.hyper_catcher_sprite))
         }
 
-    def BuildBackground(self):
-        image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
-        draw = ImageDraw.Draw(image)
-        left, right = ScreenX(0), ScreenX(PLAYFIELD_WIDTH)
-        draw.rectangle([left, 0, right, HEIGHT], fill=PLAYFIELD_COLOUR)
-        draw.line([left, 0, left, HEIGHT], fill=BORDER_COLOUR, width=2)
-        draw.line([right, 0, right, HEIGHT], fill=BORDER_COLOUR, width=2)
-
-        panel_width = left - 40
-        y = 30
-        for line in WrapText(self.beatmap.title, self.title_font, panel_width)[:3]:
-            draw.text((20, y), line, font=self.title_font, fill=TEXT_COLOUR)
-            y += 30
-        for line in WrapText(self.beatmap.artist, self.body_font, panel_width)[:2]:
-            draw.text((20, y), line, font=self.body_font, fill=MUTED_TEXT)
-            y += 24
-        y += 6
-        for line in WrapText(f"[{self.beatmap.version}]", self.body_font, panel_width)[:2]:
-            draw.text((20, y), line, font=self.body_font, fill=TEXT_COLOUR)
-            y += 24
+    def BuildTextLayer(self):
+        layer = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
+        lines = [
+            (Truncate(self.beatmap.title, self.title_font, SIDE_TEXT_WIDTH), self.title_font, TEXT_COLOUR, 28),
+            (Truncate(self.beatmap.artist, self.body_font, SIDE_TEXT_WIDTH), self.body_font, MUTED_TEXT, 22),
+            (Truncate(f"[{self.beatmap.version}]", self.body_font, SIDE_TEXT_WIDTH), self.body_font, TEXT_COLOUR, 22),
+        ]
         if self.beatmap.creator:
-            draw.text((20, y), f"mapped by {self.beatmap.creator}", font=self.label_font, fill=MUTED_TEXT)
-            y += 22
+            lines.append((Truncate(f"mapped by {self.beatmap.creator}", self.small_font, SIDE_TEXT_WIDTH), self.small_font, MUTED_TEXT, 20))
+        y = TEXT_MARGIN
+        for text, font, colour, height in lines:
+            OutlinedText(draw, (TEXT_MARGIN, y), text, font, colour)
+            y += height
 
-        y += 30
-        draw.text((20, y), "PLAYER", font=self.label_font, fill=MUTED_TEXT)
-        draw.text((20, y + 20), self.replay.username, font=self.medium_font, fill=TEXT_COLOUR)
         mods = self.replay.mods.Acronyms()
-        draw.text((20, y + 60), "+" + " ".join(mods) if mods else "No mods", font=self.body_font, fill=MUTED_TEXT)
+        right = WIDTH - TEXT_MARGIN
+        OutlinedText(draw, (right, HEIGHT - 52), Truncate(self.replay.username, self.player_font, SIDE_TEXT_WIDTH),
+                     self.player_font, TEXT_COLOUR, anchor="rs")
+        OutlinedText(draw, (right, HEIGHT - 28), "+" + " ".join(mods) if mods else "No mods", self.body_font, MUTED_TEXT, anchor="rs")
+        return layer
 
-        right_x = right + 20
-        draw.text((right_x, 30), "ACCURACY", font=self.label_font, fill=MUTED_TEXT)
-        draw.text((right_x, 130), "COMBO", font=self.label_font, fill=MUTED_TEXT)
-        draw.text((right_x, 230), "MISSES", font=self.label_font, fill=MUTED_TEXT)
-        return image
+    def BuildBackground(self, image, dim_play, dim_rest):
+        """Pre-build the background at DIM_STEPS levels from rest to play, so frames only pick one."""
+        base = image if image is not None else Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+        text = self.BuildTextLayer()
+        variants = []
+        for step in range(DIM_STEPS):
+            dim = dim_rest + (dim_play - dim_rest) * step / (DIM_STEPS - 1)
+            dimmed = ImageEnhance.Brightness(base).enhance(1 - dim) if image is not None else base.copy()
+            variants.append(Image.alpha_composite(dimmed.convert("RGBA"), text).convert("RGB"))
+        return variants
+
+    def PlayAmount(self, time):
+        """0 while resting, 1 during play, ramping over DIM_FADE_MS at each edge."""
+        index = bisect.bisect_right(self.rest_starts, time) - 1
+        distances = []
+        for start, end in self.rest_intervals[max(index, 0):index + 2]:
+            if start <= time <= end:
+                return 0.0
+            distances.append(start - time if time < start else time - end)
+        nearest = min(distances) if distances else DIM_FADE_MS
+        return min(nearest / DIM_FADE_MS, 1.0)
+
+    def BackgroundAt(self, time):
+        return self.backgrounds[round(self.PlayAmount(time) * (DIM_STEPS - 1))]
 
     def ObjectY(self, obj, time):
         return PLATE_Y - (obj.time - time) * self.fall_speed
@@ -250,9 +278,9 @@ class FrameRenderer:
         progress = age / POP_MS
         radius = self.fruit_diameter * (0.3 + 0.4 * progress)
         colour = BANANA_COLOUR if obj.kind == BANANA else self.beatmap.combo_colours[obj.colour_index]
-        faded = Mix(colour, PLAYFIELD_COLOUR, 1 - progress)
         x = ScreenX(obj.x)
-        draw.ellipse([x - radius, PLATE_Y - radius * 0.5, x + radius, PLATE_Y + radius * 0.5], outline=faded, width=3)
+        draw.ellipse([x - radius, PLATE_Y - radius * 0.5, x + radius, PLATE_Y + radius * 0.5], outline=colour,
+                     width=max(1, round(3 * (1 - progress))))
 
     def DrawCatcher(self, frame, time):
         hyper = self.IsHyperdashing(time)
@@ -278,7 +306,7 @@ class FrameRenderer:
 
     def RenderFrame(self, index):
         time = self.start_time + index * self.ms_per_frame
-        frame = self.background.copy()
+        frame = self.BackgroundAt(time).copy()
         draw = ImageDraw.Draw(frame)
         self.DrawObjects(frame, draw, time)
         self.DrawCatcher(frame, time)
